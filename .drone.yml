@@ -1,0 +1,189 @@
+kind: pipeline
+type: docker
+name: package
+
+# A Stenopos-org registry package (ADR-0039 §4.7). Every push is built and
+# tested with the tagma the registry pins (its syntagma.lock), against the
+# published index; main is published to GitHub. A tag v<version> publishes
+# that version: the tag goes to GitHub first (the registry entry points at
+# the commit there), then `tagma publish` tests the tagged commit again,
+# hashes it, finds its capabilities, writes the entry into a checkout of
+# Stenopos/registry and signs it with the CI publisher key (secret
+# registry_publisher_key, key name stenopos-ci), and CI pushes that commit to
+# Gitea. The registry's pipeline then re-derives the entry from source,
+# re-signs the snapshot and publishes the index. A tag retract/<version> retracts
+# that version the same way (tagma retract). Every tag CI acts on must be signed
+# by a release signer (stenopos-verify-tag), at the commit being built.
+
+trigger:
+  event:
+    - push
+    - pull_request
+    - tag
+
+image_pull_secrets:
+  - dockerconfig
+
+steps:
+  - name: checks
+    image: gitea.tuxsmash.com/stenopos/ci:latest
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - stenopos-checks
+      - stenopos-fetch-asset Stenopos/Syntagma newest stenopos-bootstrap-seed-x86_64 .seed
+
+  - name: tagma
+    image: rust:1.80
+    commands:
+      - |
+        set -eu
+        git clone -q https://gitea.tuxsmash.com/Stenopos/registry.git ../registry
+        pin="$(awk '$1=="commit"{print $2}' ../registry/syntagma.lock)"
+        git clone -q https://gitea.tuxsmash.com/Stenopos/Syntagma.git ../Syntagma
+        git -C ../Syntagma checkout -q "$pin"
+        bash ../Syntagma/scripts/ci-llvm.sh
+        seed="$PWD/.seed"
+        if [ -f ../Syntagma/ci/seed/stenopos-bootstrap-seed-x86_64 ]; then seed="$PWD/../Syntagma/ci/seed/stenopos-bootstrap-seed-x86_64"; fi
+        chmod +x "$seed"
+        git clone -q https://gitea.tuxsmash.com/Stenopos/std.git ../std
+        git -C ../std checkout -q "$(awk '$1=="commit"{print $2}' ../Syntagma/std.lock)"
+        STENOPOS_STD="$PWD/../std" bash ../Syntagma/scripts/build-tagma.sh "$seed" ../tagma
+        rm -f .seed
+    depends_on:
+      - checks
+    extra_hosts:
+      - gitea.tuxsmash.com:192.168.60.2
+
+  - name: test
+    image: rust:1.80
+    commands:
+      - |
+        set -eu
+        bash ../Syntagma/scripts/ci-llvm.sh
+        export STENOPOS_STD="$PWD/../std" STENOPOS_RUNTIME="$PWD/../Syntagma/runtime/stenopos_runtime.c" STENOPOS_CACHE="$PWD/../cache"
+        ../tagma check
+        ../tagma test
+        ../tagma caps
+    depends_on:
+      - tagma
+    extra_hosts:
+      - gitea.tuxsmash.com:192.168.60.2
+
+  - name: verify-tag
+    image: gitea.tuxsmash.com/stenopos/ci:latest
+    commands:
+      - stenopos-verify-tag
+    depends_on:
+      - checks
+    when:
+      event:
+        - tag
+    extra_hosts:
+      - gitea.tuxsmash.com:192.168.60.2
+
+  - name: publish-version
+    image: rust:1.80
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+      GITEA_TOKEN:
+        from_secret: gitea_token
+      REGISTRY_PUBLISHER_KEY:
+        from_secret: registry_publisher_key
+    commands:
+      - |
+        set -eu
+        if [ -z "$${REGISTRY_PUBLISHER_KEY:-}" ]; then
+          echo "FATAL: the Drone secret registry_publisher_key is not set, so the version can't be signed." >&2
+          echo "Add the stenopos-ci publisher key's private half (its root-signed statement is keys/stenopos-ci.toml in the registry):" >&2
+          echo "  drone orgsecret add Stenopos registry_publisher_key @<private key file>" >&2
+          exit 1
+        fi
+        bash ../Syntagma/scripts/ci-llvm.sh
+        export STENOPOS_STD="$PWD/../std" STENOPOS_RUNTIME="$PWD/../Syntagma/runtime/stenopos_runtime.c" STENOPOS_CACHE="$PWD/../cache"
+        # The tagged commit on GitHub first: the entry points at it there.
+        git fetch -q --unshallow origin 2>/dev/null || true
+        auth=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+        git -c http.extraheader="AUTHORIZATION: basic $auth" push -q "https://github.com/Stenopos/dotenv.git" "refs/tags/$DRONE_TAG"
+        key=$(mktemp)
+        trap 'rm -f "$key"' EXIT
+        printf '%s\n' "$REGISTRY_PUBLISHER_KEY" > "$key"
+        chmod 600 "$key"
+        ../tagma publish --registry ../registry --key "$key" --publisher stenopos-ci --tag "$DRONE_TAG"
+        # Another publish may have landed first: replay ours on top and retry.
+        for attempt in 1 2 3; do
+          if git -C ../registry -c http.extraheader="Authorization: token $GITEA_TOKEN" push -q https://gitea.tuxsmash.com/Stenopos/registry.git HEAD:refs/heads/main; then
+            echo "pushed the entry to Stenopos/registry"
+            exit 0
+          fi
+          git -C ../registry pull -q --rebase https://gitea.tuxsmash.com/Stenopos/registry.git main
+        done
+        echo "FATAL: could not push the entry to Stenopos/registry" >&2
+        exit 1
+    depends_on:
+      - test
+      - verify-tag
+    when:
+      event:
+        - tag
+      ref:
+        - refs/tags/v*
+    extra_hosts:
+      - gitea.tuxsmash.com:192.168.60.2
+
+  - name: retract-version
+    image: rust:1.80
+    environment:
+      GITEA_TOKEN:
+        from_secret: gitea_token
+      REGISTRY_PUBLISHER_KEY:
+        from_secret: registry_publisher_key
+    commands:
+      - |
+        set -eu
+        if [ -z "$${REGISTRY_PUBLISHER_KEY:-}" ]; then
+          echo "FATAL: the Drone secret registry_publisher_key is not set, so the retraction can't be signed." >&2
+          exit 1
+        fi
+        export STENOPOS_STD="$PWD/../std" STENOPOS_CACHE="$PWD/../cache"
+        key=$(mktemp)
+        trap 'rm -f "$key"' EXIT
+        printf '%s\n' "$REGISTRY_PUBLISHER_KEY" > "$key"
+        chmod 600 "$key"
+        ../tagma retract "$${DRONE_TAG#retract/}" --registry ../registry --key "$key" --publisher stenopos-ci --tag "$DRONE_TAG"
+        for attempt in 1 2 3; do
+          if git -C ../registry -c http.extraheader="Authorization: token $GITEA_TOKEN" push -q https://gitea.tuxsmash.com/Stenopos/registry.git HEAD:refs/heads/main; then
+            echo "pushed the retraction to Stenopos/registry"
+            exit 0
+          fi
+          git -C ../registry pull -q --rebase https://gitea.tuxsmash.com/Stenopos/registry.git main
+        done
+        echo "FATAL: could not push the retraction to Stenopos/registry" >&2
+        exit 1
+    depends_on:
+      - tagma
+      - verify-tag
+    when:
+      event:
+        - tag
+      ref:
+        - refs/tags/retract/*
+    extra_hosts:
+      - gitea.tuxsmash.com:192.168.60.2
+
+  - name: publish
+    image: gitea.tuxsmash.com/stenopos/ci:latest
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - stenopos-publish Stenopos/dotenv
+    depends_on:
+      - test
+    when:
+      event:
+        - push
+      branch:
+        - main

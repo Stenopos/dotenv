@@ -1,0 +1,196 @@
+// dotenv: read `.env` files, one KEY=VALUE per line, into an ordered set of
+// variables. `parse` is pure; `load` reads a file, so the package uses the
+// File capability, and a project grants it File (`tagma add` does).
+//
+//   # a comment
+//   export PORT=8080            `export ` is allowed and ignored
+//   NAME = Stenopos             spaces around `=` and the value are trimmed
+//   GREETING="Hello\nworld"     double quotes: \n \t \r \" \\ escapes
+//   PATTERN='a\nb'              single quotes: the text exactly as written
+//   EMPTY=
+//   URL=http://x # comment      ` #` starts a comment in an unquoted value
+//
+// Values are taken literally: `$VAR` and `${VAR}` are not expanded. When a
+// key appears twice, the last value wins and the key keeps its first place.
+module dotenv
+
+pub struct Dotenv {
+    pub List[str] keys
+    pub List[str] values
+    pub List[str] problems              // "line N: what is wrong"
+
+    // The value of `key`, or null when the file doesn't set it.
+    pub func get(str key) -> str? {
+        int32 i = this.index(key)
+        if (i < 0) {
+            return null
+        }
+        return this.values.get(i)
+    }
+
+    // The value of `key`, or `fallback` when the file doesn't set it.
+    pub func get_or(str key, str fallback) -> str {
+        int32 i = this.index(key)
+        if (i < 0) {
+            return fallback
+        }
+        return this.values.get(i)
+    }
+
+    pub func has(str key) -> bool {
+        return this.index(key) >= 0
+    }
+
+    pub func len() -> int32 {
+        return cast[int32](this.keys.len())
+    }
+
+    func index(str key) -> int32 {
+        int32 i = 0
+        while (i < cast[int32](this.keys.len())) {
+            if (this.keys.get(i) == key) {
+                return i
+            }
+            i += 1
+        }
+        return -1
+    }
+}
+
+// A key: letters, digits and _, not starting with a digit.
+pub func valid_key(str k) -> bool {
+    if (k.len() == 0) {
+        return false
+    }
+    int64 i = 0
+    while (i < k.len()) {
+        int32 c = k.byte_at(i)
+        bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+        if (!letter && !(i > 0 && c >= '0' && c <= '9')) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// After a closing quote only blanks or a comment may follow.
+func only_comment(str rest) -> bool {
+    str t = rest.trim()
+    return t == "" || t.starts_with("#")
+}
+
+// A double-quoted value's text (after the opening quote), with its escapes
+// resolved; `problem` gets a message when it is not closed or has a bad escape.
+func double_quoted(str s, List[str] problem) -> str {
+    str out = ""
+    int64 i = 0
+    while (i < s.len()) {
+        int32 c = s.byte_at(i)
+        if (c == '"') {
+            if (!only_comment(s.substring(i + 1, s.len()))) {
+                problem.push("unexpected text after the closing quote")
+            }
+            return out
+        }
+        if (c == '\\') {
+            if (i + 1 >= s.len()) {
+                break
+            }
+            int32 e = s.byte_at(i + 1)
+            if (e == 'n') {
+                out = out + "\n"
+            } else if (e == 't') {
+                out = out + "\t"
+            } else if (e == 'r') {
+                out = out + "\r"
+            } else if (e == '"') {
+                out = out + "\""
+            } else if (e == '\\') {
+                out = out + "\\"
+            } else {
+                problem.push("unknown escape \\" + s.substring(i + 1, i + 2) + " (use \\n \\t \\r \\\" or \\\\)")
+                return out
+            }
+            i += 2
+            continue
+        }
+        out = out + s.substring(i, i + 1)
+        i += 1
+    }
+    problem.push("a double-quoted value is not closed (values are one line)")
+    return out
+}
+
+// The value part of a line (after `=`); `problem` gets a message when it is
+// malformed.
+func value_of(str raw, List[str] problem) -> str {
+    str v = raw.trim()
+    if (v.starts_with("\"")) {
+        return double_quoted(v.substring(1, v.len()), problem)
+    }
+    if (v.starts_with("'")) {
+        str rest = v.substring(1, v.len())
+        int64 close = rest.index_of("'")
+        if (close < 0) {
+            problem.push("a single-quoted value is not closed (values are one line)")
+            return ""
+        }
+        if (!only_comment(rest.substring(close + 1, rest.len()))) {
+            problem.push("unexpected text after the closing quote")
+        }
+        return rest.substring(0, close)
+    }
+    int64 hash = v.index_of(" #")
+    if (hash >= 0) {
+        v = v.substring(0, hash)
+    }
+    return v.trim()
+}
+
+// The variables in a `.env` file's text. Lines that can't be read are
+// skipped and described in `problems`.
+pub func parse(str text) -> Dotenv {
+    Dotenv env = Dotenv { keys: list_new(), values: list_new(), problems: list_new() }
+    int32 n = 0
+    for (raw in text.split("\n")) {
+        n += 1
+        str line = raw.trim()
+        if (line == "" || line.starts_with("#")) {
+            continue
+        }
+        if (line.starts_with("export ")) {
+            line = line.substring(7, line.len()).trim()
+        }
+        int64 eq = line.index_of("=")
+        if (eq < 0) {
+            env.problems.push("line {n}: expected KEY=VALUE")
+            continue
+        }
+        str key = line.substring(0, eq).trim()
+        if (!valid_key(key)) {
+            env.problems.push("line {n}: `" + key + "` is not a key (letters, digits and _, not starting with a digit)")
+            continue
+        }
+        List[str] problem = list_new()
+        str value = value_of(line.substring(eq + 1, line.len()), problem)
+        if (problem.len() > 0) {
+            env.problems.push("line {n}: " + problem.get(0))
+            continue
+        }
+        int32 at = env.index(key)
+        if (at >= 0) {
+            env.values.set(at, value)
+        } else {
+            env.keys.push(key)
+            env.values.push(value)
+        }
+    }
+    return env
+}
+
+// The variables in the file at `path`. A missing or empty file has none.
+@cap(File)
+pub func load(str path) -> Dotenv {
+    return parse(read_file(path))
+}

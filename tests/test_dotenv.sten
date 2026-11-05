@@ -1,0 +1,70 @@
+import dotenv.{Dotenv, parse, load, valid_key}
+
+func expect(bool ok, str what) -> void {
+    if (!ok) {
+        fail(what)
+    }
+}
+
+@test
+func plain_values() -> void {
+    Dotenv env = parse("PORT=8080\nNAME = Stenopos  \n\nEMPTY=\n")
+    expect(env.len() == 3, "three variables")
+    expect(env.get_or("PORT", "") == "8080", "PORT")
+    expect(env.get_or("NAME", "") == "Stenopos", "spaces are trimmed")
+    expect(env.get_or("EMPTY", "x") == "", "an empty value")
+    expect(env.problems.len() == 0, "no problems")
+}
+
+@test
+func comments_and_export() -> void {
+    Dotenv env = parse("# setup\nexport HOST=example.org\nURL=http://x/#frag # the url\n")
+    expect(env.get_or("HOST", "") == "example.org", "export is ignored")
+    expect(env.get_or("URL", "") == "http://x/#frag", "` #` starts a comment, `#` alone does not")
+    expect(!env.has("setup"), "a comment line sets nothing")
+}
+
+@test
+func quoting() -> void {
+    Dotenv env = parse("A=\"one\\ntwo\" # c\nB='a\\nb'\nC=\"say \\\"hi\\\"\"\nD=' keep '\n")
+    expect(env.get_or("A", "") == "one\ntwo", "double quotes resolve escapes")
+    expect(env.get_or("B", "") == "a\\nb", "single quotes are literal")
+    expect(env.get_or("C", "") == "say \"hi\"", "escaped quotes")
+    expect(env.get_or("D", "") == " keep ", "quoted spaces are kept")
+    expect(env.problems.len() == 0, "no problems")
+}
+
+@test
+func last_value_wins() -> void {
+    Dotenv env = parse("X=1\nY=2\nX=3\n")
+    expect(env.len() == 2, "a key is kept once")
+    expect(env.keys.get(0) == "X", "in its first place")
+    expect(env.get_or("X", "") == "3", "with its last value")
+}
+
+@test
+func problems_are_reported() -> void {
+    Dotenv env = parse("OK=1\nnot a line\n9X=1\nQ=\"open\nR='open\nS=\"a\" b\nT=\"\\q\"\n")
+    expect(env.len() == 1, "only the good line is read")
+    expect(env.problems.len() == 6, "one problem per bad line")
+    expect(env.problems.get(0) == "line 2: expected KEY=VALUE", "line numbers")
+    str? missing = env.get("MISSING")
+    expect(missing == null, "get of an unset key is null")
+}
+
+@test
+func keys() -> void {
+    expect(valid_key("_A1"), "_A1")
+    expect(!valid_key("1A"), "1A")
+    expect(!valid_key("A-B"), "A-B")
+    expect(!valid_key(""), "empty")
+}
+
+@cap(File)
+@test
+func loads_a_file() -> void {
+    Dotenv env = load("tests/fixture.env")
+    expect(env.len() == 2, "load reads the file")
+    expect(env.get_or("K", "") == "v" && env.get_or("NAME", "") == "Stenopos", "its values")
+    expect(load("tests/no-such.env").len() == 0, "a missing file has no variables")
+}
