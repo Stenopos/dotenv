@@ -32,7 +32,11 @@ steps:
         from_secret: github_token
     commands:
       - stenopos-checks
-      - stenopos-fetch-asset Stenopos/Syntagma newest stenopos-bootstrap-seed-x86_64 .seed
+      - git clone -q --depth 1 https://gitea.tuxsmash.com/Stenopos/registry.git .ci-registry
+      - stenopos-fetch-seed .ci-registry/syntagma.lock .seed
+      - rm -rf .ci-registry
+    extra_hosts:
+      - gitea.tuxsmash.com:192.168.60.2
 
   - name: tagma
     image: rust:1.80
