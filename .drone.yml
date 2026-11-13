@@ -14,6 +14,10 @@ name: package
 # re-signs the snapshot and publishes the index. A tag retract/<version> retracts
 # that version the same way (tagma retract). Every tag CI acts on must be signed
 # by a release signer (stenopos-verify-tag), at the commit being built.
+#
+# Steps share only the workspace, so everything a later step needs (the
+# Syntagma and std checkouts, tagma, the package cache, the registry
+# checkout) lives in .ci/ inside it, never in ../.
 
 trigger:
   event:
@@ -43,17 +47,18 @@ steps:
     commands:
       - |
         set -eu
-        git clone -q https://gitea.tuxsmash.com/Stenopos/registry.git ../registry
-        pin="$(awk '$1=="commit"{print $2}' ../registry/syntagma.lock)"
-        git clone -q https://gitea.tuxsmash.com/Stenopos/Syntagma.git ../Syntagma
-        git -C ../Syntagma checkout -q "$pin"
-        bash ../Syntagma/scripts/ci-llvm.sh
+        mkdir -p .ci
+        git clone -q https://gitea.tuxsmash.com/Stenopos/registry.git .ci/registry
+        pin="$(awk '$1=="commit"{print $2}' .ci/registry/syntagma.lock)"
+        git clone -q https://gitea.tuxsmash.com/Stenopos/Syntagma.git .ci/Syntagma
+        git -C .ci/Syntagma checkout -q "$pin"
+        bash .ci/Syntagma/scripts/ci-llvm.sh
         seed="$PWD/.seed"
-        if [ -f ../Syntagma/ci/seed/stenopos-bootstrap-seed-x86_64 ]; then seed="$PWD/../Syntagma/ci/seed/stenopos-bootstrap-seed-x86_64"; fi
+        if [ -f .ci/Syntagma/ci/seed/stenopos-bootstrap-seed-x86_64 ]; then seed="$PWD/.ci/Syntagma/ci/seed/stenopos-bootstrap-seed-x86_64"; fi
         chmod +x "$seed"
-        git clone -q https://gitea.tuxsmash.com/Stenopos/std.git ../std
-        git -C ../std checkout -q "$(awk '$1=="commit"{print $2}' ../Syntagma/std.lock)"
-        STENOPOS_STD="$PWD/../std" bash ../Syntagma/scripts/build-tagma.sh "$seed" ../tagma
+        git clone -q https://gitea.tuxsmash.com/Stenopos/std.git .ci/std
+        git -C .ci/std checkout -q "$(awk '$1=="commit"{print $2}' .ci/Syntagma/std.lock)"
+        STENOPOS_STD="$PWD/.ci/std" bash .ci/Syntagma/scripts/build-tagma.sh "$seed" .ci/tagma
         rm -f .seed
     depends_on:
       - checks
@@ -65,11 +70,11 @@ steps:
     commands:
       - |
         set -eu
-        bash ../Syntagma/scripts/ci-llvm.sh
-        export STENOPOS_STD="$PWD/../std" STENOPOS_RUNTIME="$PWD/../Syntagma/runtime/stenopos_runtime.c" STENOPOS_CACHE="$PWD/../cache"
-        ../tagma check
-        ../tagma test
-        ../tagma caps
+        bash .ci/Syntagma/scripts/ci-llvm.sh
+        export STENOPOS_STD="$PWD/.ci/std" STENOPOS_RUNTIME="$PWD/.ci/Syntagma/runtime/stenopos_runtime.c" STENOPOS_CACHE="$PWD/.ci/cache"
+        .ci/tagma check
+        .ci/tagma test
+        .ci/tagma caps
     depends_on:
       - tagma
     extra_hosts:
@@ -105,8 +110,8 @@ steps:
           echo "  drone orgsecret add Stenopos registry_publisher_key @<private key file>" >&2
           exit 1
         fi
-        bash ../Syntagma/scripts/ci-llvm.sh
-        export STENOPOS_STD="$PWD/../std" STENOPOS_RUNTIME="$PWD/../Syntagma/runtime/stenopos_runtime.c" STENOPOS_CACHE="$PWD/../cache"
+        bash .ci/Syntagma/scripts/ci-llvm.sh
+        export STENOPOS_STD="$PWD/.ci/std" STENOPOS_RUNTIME="$PWD/.ci/Syntagma/runtime/stenopos_runtime.c" STENOPOS_CACHE="$PWD/.ci/cache"
         # The tagged commit on GitHub first: the entry points at it there.
         git fetch -q --unshallow origin 2>/dev/null || true
         auth=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
@@ -115,14 +120,14 @@ steps:
         trap 'rm -f "$key"' EXIT
         printf '%s\n' "$REGISTRY_PUBLISHER_KEY" > "$key"
         chmod 600 "$key"
-        ../tagma publish --registry ../registry --key "$key" --publisher stenopos-ci --tag "$DRONE_TAG"
+        .ci/tagma publish --registry .ci/registry --key "$key" --publisher stenopos-ci --tag "$DRONE_TAG"
         # Another publish may have landed first: replay ours on top and retry.
         for attempt in 1 2 3; do
-          if git -C ../registry -c http.extraheader="Authorization: token $GITEA_TOKEN" push -q https://gitea.tuxsmash.com/Stenopos/registry.git HEAD:refs/heads/main; then
+          if git -C .ci/registry -c http.extraheader="Authorization: token $GITEA_TOKEN" push -q https://gitea.tuxsmash.com/Stenopos/registry.git HEAD:refs/heads/main; then
             echo "pushed the entry to Stenopos/registry"
             exit 0
           fi
-          git -C ../registry pull -q --rebase https://gitea.tuxsmash.com/Stenopos/registry.git main
+          git -C .ci/registry pull -q --rebase https://gitea.tuxsmash.com/Stenopos/registry.git main
         done
         echo "FATAL: could not push the entry to Stenopos/registry" >&2
         exit 1
@@ -151,18 +156,18 @@ steps:
           echo "FATAL: the Drone secret registry_publisher_key is not set, so the retraction can't be signed." >&2
           exit 1
         fi
-        export STENOPOS_STD="$PWD/../std" STENOPOS_CACHE="$PWD/../cache"
+        export STENOPOS_STD="$PWD/.ci/std" STENOPOS_CACHE="$PWD/.ci/cache"
         key=$(mktemp)
         trap 'rm -f "$key"' EXIT
         printf '%s\n' "$REGISTRY_PUBLISHER_KEY" > "$key"
         chmod 600 "$key"
-        ../tagma retract "$${DRONE_TAG#retract/}" --registry ../registry --key "$key" --publisher stenopos-ci --tag "$DRONE_TAG"
+        .ci/tagma retract "$${DRONE_TAG#retract/}" --registry .ci/registry --key "$key" --publisher stenopos-ci --tag "$DRONE_TAG"
         for attempt in 1 2 3; do
-          if git -C ../registry -c http.extraheader="Authorization: token $GITEA_TOKEN" push -q https://gitea.tuxsmash.com/Stenopos/registry.git HEAD:refs/heads/main; then
+          if git -C .ci/registry -c http.extraheader="Authorization: token $GITEA_TOKEN" push -q https://gitea.tuxsmash.com/Stenopos/registry.git HEAD:refs/heads/main; then
             echo "pushed the retraction to Stenopos/registry"
             exit 0
           fi
-          git -C ../registry pull -q --rebase https://gitea.tuxsmash.com/Stenopos/registry.git main
+          git -C .ci/registry pull -q --rebase https://gitea.tuxsmash.com/Stenopos/registry.git main
         done
         echo "FATAL: could not push the retraction to Stenopos/registry" >&2
         exit 1
